@@ -498,6 +498,13 @@ enum bpf_func_id {
 	 * @skb: pointer to skb
 	 */
 	BPF_FUNC_set_hash_invalid,
+
+	/**
+	 * bpf_get_numa_node_id()
+	 * Returns the id of the current NUMA node.
+	 */
+	BPF_FUNC_get_numa_node_id,
+
 	__BPF_FUNC_MAX_ID,
 };
 
