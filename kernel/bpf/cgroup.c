@@ -178,8 +178,26 @@ cleanup:
  * __cgroup_bpf_attach() - Attach the program to a cgroup, and
  *                         propagate the change to descendants
  * @cgrp: The cgroup which descendants to traverse
- * @prog: A program to attach
- * @type: Type of attach operation
+ * @parent: The parent of @cgrp, or %NULL if @cgrp is the root
+ * @prog: A new program to pin
+ * @type: Type of pinning operation (ingress/egress)
+ *
+ * Each cgroup has a set of two pointers for bpf programs; one for eBPF
+ * programs it owns, and which is effective for execution.
+ *
+ * If @prog is not %NULL, this function attaches a new program to the cgroup
+ * and releases the one that is currently attached, if any. @prog is then made
+ * the effective program of type @type in that cgroup.
+ *
+ * If @prog is %NULL, the currently attached program of type @type is released,
+ * and the effective program of the parent cgroup (if any) is inherited to
+ * @cgrp.
+ *
+ * Then, the descendants of @cgrp are walked and the effective program for
+ * each of them is set to the effective program of @cgrp unless the
+ * descendant has its own program attached, in which case the subbranch is
+ * skipped. This ensures that delegated subcgroups with own programs are left
+ * untouched.
  *
  * Must be called with cgroup_mutex held.
  */
