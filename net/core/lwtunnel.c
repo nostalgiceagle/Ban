@@ -27,6 +27,35 @@
 #include <net/rtnetlink.h>
 #include <net/ip6_fib.h>
 
+#ifdef CONFIG_MODULES
+
+static const char *lwtunnel_encap_str(enum lwtunnel_encap_types encap_type)
+{
+	/* Only lwt encaps implemented without using an interface for
+	 * the encap need to return a string here.
+	 */
+	switch (encap_type) {
+	case LWTUNNEL_ENCAP_MPLS:
+		return "MPLS";
+	case LWTUNNEL_ENCAP_ILA:
+		return "ILA";
+	case LWTUNNEL_ENCAP_SEG6:
+		return "SEG6";
+	case LWTUNNEL_ENCAP_BPF:
+		return "BPF";
+	case LWTUNNEL_ENCAP_IP6:
+	case LWTUNNEL_ENCAP_IP:
+	case LWTUNNEL_ENCAP_NONE:
+	case __LWTUNNEL_ENCAP_MAX:
+		/* should not have got here */
+		WARN_ON(1);
+		break;
+	}
+	return NULL;
+}
+
+#endif /* CONFIG_MODULES */
+
 struct lwtunnel_state *lwtunnel_state_alloc(int encap_len)
 {
 	struct lwtunnel_state *lws;
