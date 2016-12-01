@@ -2863,6 +2863,32 @@ static bool lwt_is_valid_access(int off, int size,
 	return __is_valid_access(off, size, type);
 }
 
+static bool sock_filter_is_valid_access(int off, int size,
+					enum bpf_access_type type,
+					enum bpf_reg_type *reg_type)
+{
+	if (type == BPF_WRITE) {
+		switch (off) {
+		case offsetof(struct bpf_sock, bound_dev_if):
+			break;
+		default:
+			return false;
+		}
+	}
+
+	if (off < 0 || off + size > sizeof(struct bpf_sock))
+		return false;
+
+	/* The verifier guarantees that size > 0. */
+	if (off % size != 0)
+		return false;
+
+	if (size != sizeof(__u32))
+		return false;
+
+	return true;
+}
+
 static int tc_cls_act_prologue(struct bpf_insn *insn_buf, bool direct_write,
 			       const struct bpf_prog *prog)
 {
@@ -3122,7 +3148,7 @@ static u32 sk_filter_convert_ctx_access(enum bpf_access_type type, int dst_reg,
 }
 
 static u32 sock_filter_convert_ctx_access(enum bpf_access_type type,
-				  int dst_reg, int src_reg,
+					  int dst_reg, int src_reg,
 					  int ctx_off,
 					  struct bpf_insn *insn_buf,
 					  struct bpf_prog *prog)
@@ -3231,6 +3257,12 @@ static const struct bpf_verifier_ops lwt_xmit_ops = {
 	.gen_prologue		= tc_cls_act_prologue,
 };
 
+static const struct bpf_verifier_ops cg_sock_ops = {
+	.get_func_proto		= sk_filter_func_proto,
+	.is_valid_access	= sock_filter_is_valid_access,
+	.convert_ctx_access	= sock_filter_convert_ctx_access,
+};
+
 static struct bpf_prog_type_list sk_filter_type __read_mostly = {
 	.ops	= &sk_filter_ops,
 	.type	= BPF_PROG_TYPE_SOCKET_FILTER,
@@ -3275,6 +3307,11 @@ static struct bpf_prog_type_list lwt_xmit_type __read_mostly = {
 	.ops	= &lwt_xmit_ops,
 	.type	= BPF_PROG_TYPE_LWT_XMIT,
 >>>>>>> 3a0af8fd61f9 (bpf: BPF for lightweight tunnel infrastructure)
+};
+
+static struct bpf_prog_type_list cg_sock_type __read_mostly = {
+	.ops	= &cg_sock_ops,
+	.type	= BPF_PROG_TYPE_CGROUP_SOCK
 };
 
 static int __init register_sk_filter_ops(void)
