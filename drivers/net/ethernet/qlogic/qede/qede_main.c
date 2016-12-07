@@ -1168,6 +1168,486 @@ static struct rtnl_link_stats64 *qede_get_stats64(
 	return stats;
 }
 
+#ifdef CONFIG_QED_SRIOV
+static int qede_get_vf_config(struct net_device *dev, int vfidx,
+			      struct ifla_vf_info *ivi)
+{
+	struct qede_dev *edev = netdev_priv(dev);
+
+	if (!edev->ops)
+		return -EINVAL;
+
+	return edev->ops->iov->get_config(edev->cdev, vfidx, ivi);
+}
+
+static int qede_set_vf_rate(struct net_device *dev, int vfidx,
+			    int min_tx_rate, int max_tx_rate)
+{
+	struct qede_dev *edev = netdev_priv(dev);
+
+	return edev->ops->iov->set_rate(edev->cdev, vfidx, min_tx_rate,
+					max_tx_rate);
+}
+
+static int qede_set_vf_spoofchk(struct net_device *dev, int vfidx, bool val)
+{
+	struct qede_dev *edev = netdev_priv(dev);
+
+	if (!edev->ops)
+		return -EINVAL;
+
+	return edev->ops->iov->set_spoof(edev->cdev, vfidx, val);
+}
+
+static int qede_set_vf_link_state(struct net_device *dev, int vfidx,
+				  int link_state)
+{
+	struct qede_dev *edev = netdev_priv(dev);
+
+	if (!edev->ops)
+		return -EINVAL;
+
+	return edev->ops->iov->set_link_state(edev->cdev, vfidx, link_state);
+}
+#endif
+
+static void qede_config_accept_any_vlan(struct qede_dev *edev, bool action)
+{
+	struct qed_update_vport_params params;
+	int rc;
+
+	/* Proceed only if action actually needs to be performed */
+	if (edev->accept_any_vlan == action)
+		return;
+
+	memset(&params, 0, sizeof(params));
+
+	params.vport_id = 0;
+	params.accept_any_vlan = action;
+	params.update_accept_any_vlan_flg = 1;
+
+	rc = edev->ops->vport_update(edev->cdev, &params);
+	if (rc) {
+		DP_ERR(edev, "Failed to %s accept-any-vlan\n",
+		       action ? "enable" : "disable");
+	} else {
+		DP_INFO(edev, "%s accept-any-vlan\n",
+			action ? "enabled" : "disabled");
+		edev->accept_any_vlan = action;
+	}
+}
+
+static int qede_vlan_rx_add_vid(struct net_device *dev, __be16 proto, u16 vid)
+{
+	struct qede_dev *edev = netdev_priv(dev);
+	struct qede_vlan *vlan, *tmp;
+	int rc = 0;
+
+	DP_VERBOSE(edev, NETIF_MSG_IFUP, "Adding vlan 0x%04x\n", vid);
+
+	vlan = kzalloc(sizeof(*vlan), GFP_KERNEL);
+	if (!vlan) {
+		DP_INFO(edev, "Failed to allocate struct for vlan\n");
+		return -ENOMEM;
+	}
+	INIT_LIST_HEAD(&vlan->list);
+	vlan->vid = vid;
+	vlan->configured = false;
+
+	/* Verify vlan isn't already configured */
+	list_for_each_entry(tmp, &edev->vlan_list, list) {
+		if (tmp->vid == vlan->vid) {
+			DP_VERBOSE(edev, (NETIF_MSG_IFUP | NETIF_MSG_IFDOWN),
+				   "vlan already configured\n");
+			kfree(vlan);
+			return -EEXIST;
+		}
+	}
+
+	/* If interface is down, cache this VLAN ID and return */
+	__qede_lock(edev);
+	if (edev->state != QEDE_STATE_OPEN) {
+		DP_VERBOSE(edev, NETIF_MSG_IFDOWN,
+			   "Interface is down, VLAN %d will be configured when interface is up\n",
+			   vid);
+		if (vid != 0)
+			edev->non_configured_vlans++;
+		list_add(&vlan->list, &edev->vlan_list);
+		goto out;
+	}
+
+	/* Check for the filter limit.
+	 * Note - vlan0 has a reserved filter and can be added without
+	 * worrying about quota
+	 */
+	if ((edev->configured_vlans < edev->dev_info.num_vlan_filters) ||
+	    (vlan->vid == 0)) {
+		rc = qede_set_ucast_rx_vlan(edev,
+					    QED_FILTER_XCAST_TYPE_ADD,
+					    vlan->vid);
+		if (rc) {
+			DP_ERR(edev, "Failed to configure VLAN %d\n",
+			       vlan->vid);
+			kfree(vlan);
+			goto out;
+		}
+		vlan->configured = true;
+
+		/* vlan0 filter isn't consuming out of our quota */
+		if (vlan->vid != 0)
+			edev->configured_vlans++;
+	} else {
+		/* Out of quota; Activate accept-any-VLAN mode */
+		if (!edev->non_configured_vlans)
+			qede_config_accept_any_vlan(edev, true);
+
+		edev->non_configured_vlans++;
+	}
+
+	list_add(&vlan->list, &edev->vlan_list);
+
+out:
+	__qede_unlock(edev);
+	return rc;
+}
+
+static void qede_del_vlan_from_list(struct qede_dev *edev,
+				    struct qede_vlan *vlan)
+{
+	/* vlan0 filter isn't consuming out of our quota */
+	if (vlan->vid != 0) {
+		if (vlan->configured)
+			edev->configured_vlans--;
+		else
+			edev->non_configured_vlans--;
+	}
+
+	list_del(&vlan->list);
+	kfree(vlan);
+}
+
+static int qede_configure_vlan_filters(struct qede_dev *edev)
+{
+	int rc = 0, real_rc = 0, accept_any_vlan = 0;
+	struct qed_dev_eth_info *dev_info;
+	struct qede_vlan *vlan = NULL;
+
+	if (list_empty(&edev->vlan_list))
+		return 0;
+
+	dev_info = &edev->dev_info;
+
+	/* Configure non-configured vlans */
+	list_for_each_entry(vlan, &edev->vlan_list, list) {
+		if (vlan->configured)
+			continue;
+
+		/* We have used all our credits, now enable accept_any_vlan */
+		if ((vlan->vid != 0) &&
+		    (edev->configured_vlans == dev_info->num_vlan_filters)) {
+			accept_any_vlan = 1;
+			continue;
+		}
+
+		DP_VERBOSE(edev, NETIF_MSG_IFUP, "Adding vlan %d\n", vlan->vid);
+
+		rc = qede_set_ucast_rx_vlan(edev, QED_FILTER_XCAST_TYPE_ADD,
+					    vlan->vid);
+		if (rc) {
+			DP_ERR(edev, "Failed to configure VLAN %u\n",
+			       vlan->vid);
+			real_rc = rc;
+			continue;
+		}
+
+		vlan->configured = true;
+		/* vlan0 filter doesn't consume our VLAN filter's quota */
+		if (vlan->vid != 0) {
+			edev->non_configured_vlans--;
+			edev->configured_vlans++;
+		}
+	}
+
+	/* enable accept_any_vlan mode if we have more VLANs than credits,
+	 * or remove accept_any_vlan mode if we've actually removed
+	 * a non-configured vlan, and all remaining vlans are truly configured.
+	 */
+
+	if (accept_any_vlan)
+		qede_config_accept_any_vlan(edev, true);
+	else if (!edev->non_configured_vlans)
+		qede_config_accept_any_vlan(edev, false);
+
+	return real_rc;
+}
+
+static int qede_vlan_rx_kill_vid(struct net_device *dev, __be16 proto, u16 vid)
+{
+	struct qede_dev *edev = netdev_priv(dev);
+	struct qede_vlan *vlan = NULL;
+	int rc = 0;
+
+	DP_VERBOSE(edev, NETIF_MSG_IFDOWN, "Removing vlan 0x%04x\n", vid);
+
+	/* Find whether entry exists */
+	__qede_lock(edev);
+	list_for_each_entry(vlan, &edev->vlan_list, list)
+		if (vlan->vid == vid)
+			break;
+
+	if (!vlan || (vlan->vid != vid)) {
+		DP_VERBOSE(edev, (NETIF_MSG_IFUP | NETIF_MSG_IFDOWN),
+			   "Vlan isn't configured\n");
+		goto out;
+	}
+
+	if (edev->state != QEDE_STATE_OPEN) {
+		/* As interface is already down, we don't have a VPORT
+		 * instance to remove vlan filter. So just update vlan list
+		 */
+		DP_VERBOSE(edev, NETIF_MSG_IFDOWN,
+			   "Interface is down, removing VLAN from list only\n");
+		qede_del_vlan_from_list(edev, vlan);
+		goto out;
+	}
+
+	/* Remove vlan */
+	if (vlan->configured) {
+		rc = qede_set_ucast_rx_vlan(edev, QED_FILTER_XCAST_TYPE_DEL,
+					    vid);
+		if (rc) {
+			DP_ERR(edev, "Failed to remove VLAN %d\n", vid);
+			goto out;
+		}
+	}
+
+	qede_del_vlan_from_list(edev, vlan);
+
+	/* We have removed a VLAN - try to see if we can
+	 * configure non-configured VLAN from the list.
+	 */
+	rc = qede_configure_vlan_filters(edev);
+
+out:
+	__qede_unlock(edev);
+	return rc;
+}
+
+static void qede_vlan_mark_nonconfigured(struct qede_dev *edev)
+{
+	struct qede_vlan *vlan = NULL;
+
+	if (list_empty(&edev->vlan_list))
+		return;
+
+	list_for_each_entry(vlan, &edev->vlan_list, list) {
+		if (!vlan->configured)
+			continue;
+
+		vlan->configured = false;
+
+		/* vlan0 filter isn't consuming out of our quota */
+		if (vlan->vid != 0) {
+			edev->non_configured_vlans++;
+			edev->configured_vlans--;
+		}
+
+		DP_VERBOSE(edev, NETIF_MSG_IFDOWN,
+			   "marked vlan %d as non-configured\n", vlan->vid);
+	}
+
+	edev->accept_any_vlan = false;
+}
+
+static void qede_set_features_reload(struct qede_dev *edev,
+				     struct qede_reload_args *args)
+{
+	edev->ndev->features = args->u.features;
+}
+
+int qede_set_features(struct net_device *dev, netdev_features_t features)
+{
+	struct qede_dev *edev = netdev_priv(dev);
+	netdev_features_t changes = features ^ dev->features;
+	bool need_reload = false;
+
+	/* No action needed if hardware GRO is disabled during driver load */
+	if (changes & NETIF_F_GRO) {
+		if (dev->features & NETIF_F_GRO)
+			need_reload = !edev->gro_disable;
+		else
+			need_reload = edev->gro_disable;
+	}
+
+	if (need_reload) {
+		struct qede_reload_args args;
+
+		args.u.features = features;
+		args.func = &qede_set_features_reload;
+
+		/* Make sure that we definitely need to reload.
+		 * In case of an eBPF attached program, there will be no FW
+		 * aggregations, so no need to actually reload.
+		 */
+		__qede_lock(edev);
+		if (edev->xdp_prog)
+			args.func(edev, &args);
+		else
+			qede_reload(edev, &args, true);
+		__qede_unlock(edev);
+
+		return 1;
+	}
+
+	return 0;
+}
+
+static void qede_udp_tunnel_add(struct net_device *dev,
+				struct udp_tunnel_info *ti)
+{
+	struct qede_dev *edev = netdev_priv(dev);
+	u16 t_port = ntohs(ti->port);
+
+	switch (ti->type) {
+	case UDP_TUNNEL_TYPE_VXLAN:
+		if (edev->vxlan_dst_port)
+			return;
+
+		edev->vxlan_dst_port = t_port;
+
+		DP_VERBOSE(edev, QED_MSG_DEBUG, "Added vxlan port=%d\n",
+			   t_port);
+
+		set_bit(QEDE_SP_VXLAN_PORT_CONFIG, &edev->sp_flags);
+		break;
+	case UDP_TUNNEL_TYPE_GENEVE:
+		if (edev->geneve_dst_port)
+			return;
+
+		edev->geneve_dst_port = t_port;
+
+		DP_VERBOSE(edev, QED_MSG_DEBUG, "Added geneve port=%d\n",
+			   t_port);
+		set_bit(QEDE_SP_GENEVE_PORT_CONFIG, &edev->sp_flags);
+		break;
+	default:
+		return;
+	}
+
+	schedule_delayed_work(&edev->sp_task, 0);
+}
+
+static void qede_udp_tunnel_del(struct net_device *dev,
+				struct udp_tunnel_info *ti)
+{
+	struct qede_dev *edev = netdev_priv(dev);
+	u16 t_port = ntohs(ti->port);
+
+	switch (ti->type) {
+	case UDP_TUNNEL_TYPE_VXLAN:
+		if (t_port != edev->vxlan_dst_port)
+			return;
+
+		edev->vxlan_dst_port = 0;
+
+		DP_VERBOSE(edev, QED_MSG_DEBUG, "Deleted vxlan port=%d\n",
+			   t_port);
+
+		set_bit(QEDE_SP_VXLAN_PORT_CONFIG, &edev->sp_flags);
+		break;
+	case UDP_TUNNEL_TYPE_GENEVE:
+		if (t_port != edev->geneve_dst_port)
+			return;
+
+		edev->geneve_dst_port = 0;
+
+		DP_VERBOSE(edev, QED_MSG_DEBUG, "Deleted geneve port=%d\n",
+			   t_port);
+		set_bit(QEDE_SP_GENEVE_PORT_CONFIG, &edev->sp_flags);
+		break;
+	default:
+		return;
+	}
+
+	schedule_delayed_work(&edev->sp_task, 0);
+}
+
+/* 8B udp header + 8B base tunnel header + 32B option length */
+#define QEDE_MAX_TUN_HDR_LEN 48
+
+static netdev_features_t qede_features_check(struct sk_buff *skb,
+					     struct net_device *dev,
+					     netdev_features_t features)
+{
+	if (skb->encapsulation) {
+		u8 l4_proto = 0;
+
+		switch (vlan_get_protocol(skb)) {
+		case htons(ETH_P_IP):
+			l4_proto = ip_hdr(skb)->protocol;
+			break;
+		case htons(ETH_P_IPV6):
+			l4_proto = ipv6_hdr(skb)->nexthdr;
+			break;
+		default:
+			return features;
+		}
+
+		/* Disable offloads for geneve tunnels, as HW can't parse
+		 * the geneve header which has option length greater than 32B.
+		 */
+		if ((l4_proto == IPPROTO_UDP) &&
+		    ((skb_inner_mac_header(skb) -
+		      skb_transport_header(skb)) > QEDE_MAX_TUN_HDR_LEN))
+			return features & ~(NETIF_F_CSUM_MASK |
+					    NETIF_F_GSO_MASK);
+	}
+
+	return features;
+}
+
+static void qede_xdp_reload_func(struct qede_dev *edev,
+				 struct qede_reload_args *args)
+{
+	struct bpf_prog *old;
+
+	old = xchg(&edev->xdp_prog, args->u.new_prog);
+	if (old)
+		bpf_prog_put(old);
+}
+
+static int qede_xdp_set(struct qede_dev *edev, struct bpf_prog *prog)
+{
+	struct qede_reload_args args;
+
+	if (prog && prog->xdp_adjust_head) {
+		DP_ERR(edev, "Does not support bpf_xdp_adjust_head()\n");
+		return -EOPNOTSUPP;
+	}
+
+	/* If we're called, there was already a bpf reference increment */
+	args.func = &qede_xdp_reload_func;
+	args.u.new_prog = prog;
+	qede_reload(edev, &args, false);
+
+	return 0;
+}
+
+static int qede_xdp(struct net_device *dev, struct netdev_xdp *xdp)
+{
+	struct qede_dev *edev = netdev_priv(dev);
+
+	switch (xdp->command) {
+	case XDP_SETUP_PROG:
+		return qede_xdp_set(edev, xdp->prog);
+	case XDP_QUERY_PROG:
+		xdp->prog_attached = !!edev->xdp_prog;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static const struct net_device_ops qede_netdev_ops = {
 	.ndo_open = qede_open,
 	.ndo_stop = qede_close,
