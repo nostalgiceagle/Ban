@@ -483,9 +483,7 @@ static void __mark_reg_unknown_value(struct bpf_reg_state *regs, u32 regno)
 static void mark_reg_unknown_value(struct bpf_reg_state *regs, u32 regno)
 {
 	BUG_ON(regno >= MAX_BPF_REG);
-	regs[regno].type = UNKNOWN_VALUE;
-	regs[regno].id = 0;
-	regs[regno].imm = 0;
+	__mark_reg_unknown_value(regs, regno);
 }
 
 static void reset_reg_range_values(struct bpf_reg_state *regs, u32 regno)
@@ -2273,7 +2271,7 @@ static void mark_map_reg(struct bpf_reg_state *regs, u32 regno, u32 id,
 		 */
 		reg->id = 0;
 		if (type == UNKNOWN_VALUE)
-			mark_reg_unknown_value(regs, regno);
+			__mark_reg_unknown_value(regs, regno);
 	}
 }
 
