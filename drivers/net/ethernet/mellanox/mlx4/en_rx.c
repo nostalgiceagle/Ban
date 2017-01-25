@@ -32,6 +32,8 @@
  */
 
 #include <net/busy_poll.h>
+#include <linux/bpf.h>
+#include <linux/bpf_trace.h>
 #include <linux/mlx4/cq.h>
 #include <linux/slab.h>
 #include <linux/mlx4/qp.h>
@@ -863,6 +865,59 @@ int mlx4_en_process_rx_cq(struct net_device *dev, struct mlx4_en_cq *cq, int bud
 		ring->packets++;
 		l2_tunnel = (dev->hw_enc_features & NETIF_F_RXCSUM) &&
 			(cqe->vlan_my_qpn & cpu_to_be32(MLX4_CQE_L2_TUNNEL));
+
+		/* A bpf program gets first chance to drop the packet. It may
+		 * read bytes but not past the end of the frag.
+		 */
+		if (xdp_prog) {
+			struct xdp_buff xdp;
+			dma_addr_t dma;
+			void *orig_data;
+			u32 act;
+
+			dma = be64_to_cpu(rx_desc->data[0].addr);
+			dma_sync_single_for_cpu(priv->ddev, dma,
+						priv->frag_info[0].frag_size,
+						DMA_FROM_DEVICE);
+
+			xdp.data_hard_start = page_address(frags[0].page);
+			xdp.data = xdp.data_hard_start + frags[0].page_offset;
+			xdp.data_end = xdp.data + length;
+			orig_data = xdp.data;
+
+			act = bpf_prog_run_xdp(xdp_prog, &xdp);
+
+			if (xdp.data != orig_data) {
+				length = xdp.data_end - xdp.data;
+				frags[0].page_offset = xdp.data -
+					xdp.data_hard_start;
+			}
+
+			switch (act) {
+			case XDP_PASS:
+				break;
+			case XDP_TX:
+				if (likely(!mlx4_en_xmit_frame(ring, frags, dev,
+							length, cq->ring,
+							&doorbell_pending)))
+					goto consumed;
+				trace_xdp_exception(dev, xdp_prog, act);
+				goto xdp_drop_no_cnt; /* Drop on xmit failure */
+			default:
+				bpf_warn_invalid_xdp_action(act);
+			case XDP_ABORTED:
+				trace_xdp_exception(dev, xdp_prog, act);
+			case XDP_DROP:
+				ring->xdp_drop++;
+xdp_drop_no_cnt:
+				if (likely(mlx4_en_rx_recycle(ring, frags)))
+					goto consumed;
+				goto next;
+			}
+		}
+
+		ring->bytes += length;
+		ring->packets++;
 
 		if (likely(dev->features & NETIF_F_RXCSUM)) {
 			/* TODO: For IP non TCP/UDP packets when csum complete is
