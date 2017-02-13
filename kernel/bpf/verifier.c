@@ -735,6 +735,7 @@ static bool may_access_direct_pkt_data(struct bpf_verifier_env *env,
 		/* dst_input() and dst_output() can't write for now */
 		if (t == BPF_WRITE)
 			return false;
+		/* fallthrough */
 	case BPF_PROG_TYPE_SCHED_CLS:
 	case BPF_PROG_TYPE_SCHED_ACT:
 	case BPF_PROG_TYPE_XDP:
@@ -2201,7 +2202,8 @@ static void reg_set_min_max(struct bpf_reg_state *true_reg,
 		is_range = false;
 		break;
 	case BPF_JGT:
-		value_from_signed = false;
+		/* Unsigned comparison, the minimum value is 0. */
+		false_reg->min_value = 0;
 		/* fallthrough */
 	case BPF_JSGT:
 		if (true_reg->value_from_signed != value_from_signed)
@@ -2221,7 +2223,8 @@ static void reg_set_min_max(struct bpf_reg_state *true_reg,
 		true_reg->value_from_signed = value_from_signed;
 		break;
 	case BPF_JGE:
-		value_from_signed = false;
+		/* Unsigned comparison, the minimum value is 0. */
+		false_reg->min_value = 0;
 		/* fallthrough */
 	case BPF_JSGE:
 		if (true_reg->value_from_signed != value_from_signed)
@@ -2280,8 +2283,9 @@ static void reg_set_min_max_inv(struct bpf_reg_state *true_reg,
 		is_range = false;
 		break;
 	case BPF_JGT:
-		value_from_signed = false;
-		/* fallthrough */
+		/* Unsigned comparison, the minimum value is 0. */
+		true_reg->min_value = 0;
+/		/* fallthrough */
 	case BPF_JSGT:
 		if (true_reg->value_from_signed != value_from_signed)
 			reset_reg_range_values(true_reg, 0);
@@ -2301,7 +2305,8 @@ static void reg_set_min_max_inv(struct bpf_reg_state *true_reg,
 		true_reg->value_from_signed = value_from_signed;
 		break;
 	case BPF_JGE:
-		value_from_signed = false;
+		/* Unsigned comparison, the minimum value is 0. */
+		true_reg->min_value = 0;
 		/* fallthrough */
 	case BPF_JSGE:
 		if (true_reg->value_from_signed != value_from_signed)
